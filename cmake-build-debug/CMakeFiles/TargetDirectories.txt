@@ -1,0 +1,3 @@
+/media/ldx/sd1/ldx/learn/三维重建/Bundle Adjustment/cmake-build-debug/CMakeFiles/Test_lm_optimize.dir
+/media/ldx/sd1/ldx/learn/三维重建/Bundle Adjustment/cmake-build-debug/CMakeFiles/edit_cache.dir
+/media/ldx/sd1/ldx/learn/三维重建/Bundle Adjustment/cmake-build-debug/CMakeFiles/rebuild_cache.dir
