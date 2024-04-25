@@ -7,6 +7,8 @@
 #include<fstream>
 #include<sstream>
 #include<cassert>
+#include<Eigen/Core>
+#include<Eigen/Dense>
 
 struct Camera {
     double focal_length = 0.0;// 焦距
@@ -30,9 +32,23 @@ std::vector<Camera> cameras;
 std::vector<Point3D> points_3d;
 std::vector<Observation> observations; // 两个视图的同名点
 
+#define TRUST_REGION_RADIUS_INIT (1000)
+#define TRUST_REGION_RADIUS_DECREMENT (1.0 / 10.0)
+#define TRUST_REGION_RADIUS_GAIN (10.0)
+
 const int lm_max_iterations = 100; // lm算法迭代次数
 double initial_mse = 0.0;
 double final_mse = 0.0;
+
+// lm 算法终止条件
+double lm_mse_threshold = 1e-16;
+double lm_delta_threshold = 1e-8;
+
+// 信赖域大小
+double trust_region_radius = 1000;
+int cg_max_iterations = 1000;
+
+const int num_cam_params = 9;
 
 
 void load_data(const std::string &file) {
@@ -139,12 +155,185 @@ void compute_reprojection_errors(std::vector<double> &vector_f) {
  * @return 误差总和
  */
 
-double compute_mse(const std::vector<double> &F){
+double compute_mse(const std::vector<double> &F) {
     double mse = 0.0;
-    for(int i = 0; i < F.size(); i++){
+    for (int i = 0; i < F.size(); i++) {
         mse += F[i] * F[i];
     }
     return mse / (F.size() / 2.0);
+}
+
+void my_jacobian(const Camera &cam, const Point3D &p3d, double *cam_x_ptr, double *cam_y_ptr, double *point_x_ptr, double *point_y_ptr) {
+    const double f = cam.focal_length;
+    const double *R = cam.rotation;
+    const double *t = cam.translation;
+    const double *X = p3d.pos;
+    const double k0 = cam.distortion[0];
+    const double k1 = cam.distortion[1];
+
+    const double xc = R[0] * X[0] + R[1] * X[1] + R[2] * X[2] + t[0];
+    const double yc = R[3] * X[0] + R[4] * X[1] + R[5] * X[2] + t[1];
+    const double zc = R[6] * X[0] + R[7] * X[1] + R[8] * X[2] + t[2];
+
+    const double x = xc / zc;
+    const double y = yc / zc;
+
+    const double r2 = x * x + y * y;
+    const double distort = 1.0 + (k0 + k1 * r2) * r2;
+
+    const double u = f * distort * x;
+    const double v = f * distort * y;
+
+    /* 关于焦距的偏导*/
+    cam_x_ptr[0] = distort * x;
+    cam_y_ptr[0] = distort * y;
+
+    /* 关于畸变系数k0,k1的偏导*/
+    // 计算中间变量
+    const double u_deriv_distort = f * x;
+    const double v_deriv_distort = f * y;
+    const double distort_deriv_k0 = r2;
+    const double distort_deriv_k1 = r2 * r2;
+
+    cam_x_ptr[1] = u_deriv_distort * distort_deriv_k0;
+    cam_x_ptr[2] = u_deriv_distort * distort_deriv_k1;
+    cam_y_ptr[1] = v_deriv_distort * distort_deriv_k0;
+    cam_y_ptr[2] = v_deriv_distort * distort_deriv_k1;
+
+    // 计算中间变量x,y关于xc,yc,zc的偏导
+    const double x_deriv_xc = 1 / zc;
+    const double x_deriv_yc = 0;
+    const double x_deriv_zc = -x / zc;
+    const double y_deriv_xc = 0;
+    const double y_deriv_yc = 1 / zc;
+    const double y_deriv_zc = -y / zc;
+
+    // 计算中间变量u,v关于x,y的偏导
+    const double u_deriv_x = f * distort;
+    const double v_deriv_y = f * distort;
+
+    // 计算中间变量distort关于r2的偏导
+    const double distort_deriv_r2 = k0 + 2 * k1 * r2;
+
+    // 计算中间变量r2关于xc,yc,zc的偏导
+    const double r2_deriv_xc = 2 * x / zc;
+    const double r2_deriv_yc = 2 * y / zc;
+    const double r2_deriv_zc = -2 * r2 / zc;
+
+    // 计算中间变量distort关于xc,yc,zc的偏导
+    const double distort_deriv_xc = distort_deriv_r2 * r2_deriv_xc;
+    const double distort_deriv_yc = distort_deriv_r2 * r2_deriv_yc;
+    const double distort_deriv_zc = distort_deriv_r2 * r2_deriv_zc;
+
+    // 计算中间变量u,v关于xc,yc,zc的偏导
+    const double u_deriv_xc = u_deriv_distort * distort_deriv_xc + u_deriv_x * x_deriv_xc;
+    const double u_deriv_yc = u_deriv_distort * distort_deriv_yc + u_deriv_x * x_deriv_yc;
+    const double u_deriv_zc = u_deriv_distort * distort_deriv_zc + u_deriv_x * x_deriv_zc;
+
+    const double v_deriv_xc = v_deriv_distort * distort_deriv_xc + v_deriv_y * y_deriv_xc;
+    const double v_deriv_yc = v_deriv_distort * distort_deriv_yc + v_deriv_y * y_deriv_yc;
+    const double v_deriv_zc = v_deriv_distort * distort_deriv_zc + v_deriv_y * y_deriv_zc;
+
+    /*关于平移向量t0,t1,t2的偏导*/
+    const double xc_deriv_t0 = 1;
+    const double yc_deriv_t1 = 1;
+    const double zc_deriv_t2 = 1;
+
+    cam_x_ptr[3] = u_deriv_xc * xc_deriv_t0;
+    cam_x_ptr[4] = u_deriv_yc * yc_deriv_t1;
+    cam_x_ptr[5] = u_deriv_zc * zc_deriv_t2;
+
+    cam_y_ptr[3] = v_deriv_xc * xc_deriv_t0;
+    cam_y_ptr[4] = v_deriv_yc * yc_deriv_t1;
+    cam_y_ptr[5] = v_deriv_zc * zc_deriv_t2;
+
+    /*计算关于旋转矩阵（表示为角轴向量w0,w1,w2）的偏导*/
+    const double rx = R[0] * X[0] + R[1] * X[1] + R[2] * X[2];
+    const double ry = R[3] * X[0] + R[4] * X[1] + R[5] * X[2];
+    const double rz = R[6] * X[0] + R[7] * X[1] + R[8] * X[2];
+    const double xc_deriv_w0 = 0;
+    const double xc_deriv_w1 = rz;
+    const double xc_deriv_w2 = -ry;
+    const double yc_deriv_w0 = -rz;
+    const double yc_deriv_w1 = 0;
+    const double yc_deriv_w2 = rx;
+    const double zc_deriv_w0 = ry;
+    const double zc_deriv_w1 = -rx;
+    const double zc_deriv_w2 = 0;
+
+    cam_x_ptr[6] = u_deriv_yc * yc_deriv_w0 + u_deriv_zc * zc_deriv_w0;
+    cam_x_ptr[7] = u_deriv_xc * xc_deriv_w1 + u_deriv_zc * zc_deriv_w1;
+    cam_x_ptr[8] = u_deriv_xc * xc_deriv_w2 + u_deriv_yc * yc_deriv_w2;
+
+    cam_x_ptr[6] = v_deriv_yc * yc_deriv_w0 + v_deriv_zc * zc_deriv_w0;
+    cam_x_ptr[7] = v_deriv_xc * xc_deriv_w1 + v_deriv_zc * zc_deriv_w1;
+    cam_x_ptr[8] = v_deriv_xc * xc_deriv_w2 + v_deriv_yc * yc_deriv_w2;
+
+    /*计算关于三维点坐标X,Y,Z的偏导*/
+    const double xc_deriv_X = R[0];
+    const double xc_deriv_Y = R[1];
+    const double xc_deriv_Z = R[2];
+    const double yc_deriv_X = R[3];
+    const double yc_deriv_Y = R[4];
+    const double yc_deriv_Z = R[5];
+    const double zc_deriv_X = R[6];
+    const double zc_deriv_Y = R[7];
+    const double zc_deriv_Z = R[8];
+
+    point_x_ptr[0] = u_deriv_xc * xc_deriv_X + u_deriv_yc * yc_deriv_X + u_deriv_zc * zc_deriv_X;
+    point_x_ptr[1] = u_deriv_xc * xc_deriv_Y + u_deriv_yc * yc_deriv_Y + u_deriv_zc * zc_deriv_Y;
+    point_x_ptr[2] = u_deriv_xc * xc_deriv_Z + u_deriv_yc * yc_deriv_Z + u_deriv_zc * zc_deriv_Z;
+
+    point_y_ptr[0] = v_deriv_xc * xc_deriv_X + v_deriv_yc * yc_deriv_X + v_deriv_zc * zc_deriv_X;
+    point_y_ptr[1] = v_deriv_xc * xc_deriv_Y + v_deriv_yc * yc_deriv_Y + v_deriv_zc * zc_deriv_Y;
+    point_y_ptr[2] = v_deriv_xc * xc_deriv_Z + v_deriv_yc * yc_deriv_Z + v_deriv_zc * zc_deriv_Z;
+}
+
+/**
+ * \description 构造雅阁比矩阵
+ *      相机参数的雅阁比矩阵大小为： (2*observations.size() * (num_cameras*9)
+ *      三维点参数的雅阁比矩阵大小为： (2*observations.size() * (num_points*3)
+ * @param jac_cam 关于相机参数的雅阁比矩阵
+ * @param jac_points 关于三维点的雅阁比矩阵
+ */
+void analytic_jacobian(Eigen::MatrixXd &jac_cam, Eigen::MatrixXd &jac_points) {
+    const int camera_cols = cameras.size() * 9;
+    const int point_cols = points_3d.size() * 3;
+    const int jacobi_rows = observations.size() * 2;
+
+    jac_cam.resize(jacobi_rows,camera_cols);
+    jac_points.resize(jacobi_rows,point_cols);
+
+    double cam_x_ptr[9], cam_y_ptr[9], point_x_ptr[3], point_y_ptr[3];
+    // 遍历每一个观察到的二维点
+    for (int i = 0; i < observations.size(); i++) {
+        const Observation &obs = observations[i];
+        //三维点坐标
+        const Point3D &p3p = points_3d[obs.point_id];
+        //相机参数
+        const Camera &cam = cameras[obs.camera_id];
+
+        /*对相机和三维点求偏导*/
+        my_jacobian(cam, p3p, cam_x_ptr, cam_y_ptr, point_x_ptr, point_y_ptr);
+
+        /*观察点对应雅阁比矩阵的行，第i个观察点对应的位置是2*i,2*i+1*/
+        int row_x = 2 * i + 0;
+        int row_y = 2 * i + 1;
+
+        //jac_cam中相机对应的列数为camera_id * n_cam_params
+        int cam_col = obs.camera_id * num_cam_params;
+        //jac_points中三维点对应的列数为point_id * 3
+        int point_col = obs.camera_id * 3;
+
+        for(int j = 0;j < num_cam_params;j++){
+            jac_cam(row_x,cam_col+j) = cam_x_ptr[j];
+            jac_cam(row_y,cam_col+j) = cam_y_ptr[j];
+        }
+        for(int j = 0; j < 3; j++){
+            jac_points(row_x,point_col+j) = point_x_ptr[j];
+            jac_points(row_y,point_col+j) = point_y_ptr[j];
+        }
+    }
 }
 
 void lm_optimization() {
@@ -153,6 +342,26 @@ void lm_optimization() {
     // 计算初始均方误差
     double current_mse = compute_mse(F);
     final_mse = initial_mse = current_mse;
+
+    //设置共轭梯度法的相关参数
+    trust_region_radius = TRUST_REGION_RADIUS_INIT;
+
+    /* Levenberg-Marquard 算法 */
+    for (int lm_iter = 0;; lm_iter++) {
+        // 当均方误差小于一定阈值时停止
+        if (current_mse < lm_mse_threshold) {
+            std::cout << "BA: Satisfied MSE threshold" << std::endl;
+        }
+        // 1、计算雅阁比矩阵
+        Eigen::MatrixXd Jc,Jp;
+        analytic_jacobian(Jc,Jp);
+        std::cout << Jc(0,0 )<< std::endl;
+
+        // 2、共轭梯度法进行求解
+
+
+    }
+
 }
 
 int main() {
