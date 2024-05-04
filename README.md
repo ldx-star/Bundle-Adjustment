@@ -7,4 +7,5 @@ $$X = X^{(k)}-\left(J(X)^TJ(X) + \mu_k I\right)^{-1}J(X)^Tr(X)$$
 
 4、结果
 重投影误差从原来的5.925e-9 降为 5.3810e-4
+
 ![image](https://github.com/ldx-star/Bundle-Adjustment/assets/80197198/9c0930c7-1bb4-4b14-b97d-9e80b1e5b1d7)
